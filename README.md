@@ -3,7 +3,7 @@ The implementation of EMNLP2020-Findings paper
 
 **Pretrained Language Models for Dialogue Generationwith Multiple Input Sources**
 
-![Block architecture](https://github.com/caoyu-noob/Multi-GPT/blob/master/block.png)
+![Block architecture](https://github.com/caoyu-noob/Multi-GPT2/blob/main/block.PNG)
 
 ## Requirements
 1. Python 3.7
