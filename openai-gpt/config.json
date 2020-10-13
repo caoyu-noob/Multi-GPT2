@@ -1,0 +1,21 @@
+{
+  "architectures": [
+    "OpenAIGPTLMHeadModel"
+  ],
+  "afn": "gelu",
+  "attn_pdrop": 0.1,
+  "embd_pdrop": 0.1,
+  "initializer_range": 0.02,
+  "layer_norm_epsilon": 1e-05,
+  "n_ctx": 512,
+  "n_embd": 768,
+  "n_head": 12,
+  "n_layer": 12,
+  "n_positions": 512,
+  "n_special": 0,
+  "resid_pdrop": 0.1,
+  "vocab_size": 40478,
+  "shared_module": true,
+  "shared_attention": false,
+  "context_size": 2
+}
