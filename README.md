@@ -7,15 +7,18 @@ The implementation of EMNLP2020-Findings paper
 
 ## Requirements
 1. Python 3.7
-2. Pyotrch==1.1.0
-3. transformers==2.5.0
+2. Pytorch==1.1.0
+3. transformers==2.5.1
 4. tensorboardX==2.0
 5. tqdm
 
-Some other dependencies may be needed.
+Some other dependencies may be needed, please take requirements.txt as a reference.
 
 We run our standard experiment using one 32GB V100 GPU. If you use a GPU with smaller memory, please increase the 
 `batch_split` or decrease the `train_batch_size` defined in `config.py`.
+
+To obtain the automatic metrics, you also need to install `java`-1.8.0, `perl` and related perl library including 
+`XML::Twig`, `Sort::Naturally`, `String::Util` (I use `cpanm` to install them on Linux).
 
 ## How to run
 
