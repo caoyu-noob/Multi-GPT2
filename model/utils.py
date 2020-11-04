@@ -17,12 +17,12 @@
 import copy
 import io
 import json
+import logging
 import os
 import random
 import re
 import sys
-import logging
-from collections import Counter, namedtuple
+from collections import Counter
 
 import numpy as np
 import torch

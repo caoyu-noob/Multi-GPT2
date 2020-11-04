@@ -17,7 +17,6 @@
 import json
 import math
 import os
-import pickle
 import random
 
 import fasttext

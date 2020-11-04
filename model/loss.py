@@ -52,12 +52,3 @@ class LabelSmoothingLoss(nn.Module):
             targets = tmp
         
         return self.criterion(log_inputs, targets)
-
-class SoftCrossEntropyLoss(nn.Module):
-    def __init(self):
-        super(SoftCrossEntropyLoss).__init__()
-
-    def forward(self, input, soft_targets, lengths):
-        log_input = -F.log_softmax(input, dim=-1)
-        loss = torch.mean(torch.sum(torch.sum(torch.mul(log_input, soft_targets), dim=-1), dim=-1) / (lengths + 0.01))
-        return loss

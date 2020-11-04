@@ -1,21 +1,25 @@
+import json
 import os
 
-import json
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
-
-from config import get_model_config, get_trainer_config, InputConfig
-from model.dataset import FacebookDataset
-from model.trainer import Trainer
-from model.gpt2_model import GPT2EncoderDecoderModel, GPT2DoubleHeadsModel
-from model.openai_model import OpenAIGPTEncoderDecoderModel
-from model.utils import f1_score, load_openai_weights, open, set_seed, unicode, config_logger
-from transformers.tokenization_openai import OpenAIGPTTokenizer
 from transformers.tokenization_gpt2 import GPT2Tokenizer
-from new_metrics import nlp_metrics
+from transformers.tokenization_openai import OpenAIGPTTokenizer
+
+from config import get_trainer_config
+from config import InputConfig
+from model.dataset import FacebookDataset
+from model.gpt2_model import GPT2DoubleHeadsModel
+from model.gpt2_model import GPT2EncoderDecoderModel
+from model.openai_model import OpenAIGPTEncoderDecoderModel
 from model.seq2seq import TransformerSeq2Seq
 from model.seq2seq_vocab import Seq2seqVocab
+from model.trainer import Trainer
+from model.utils import config_logger
+from model.utils import f1_score
+from model.utils import open
+from model.utils import set_seed
+from new_metrics import nlp_metrics
 
 PADDING_IDX = 0
 

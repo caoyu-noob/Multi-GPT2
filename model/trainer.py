@@ -14,14 +14,9 @@
 #  You should have received a copy of the GNU Affero General Public License
 #  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import datetime
 import logging
 import math
-import random
-import pickle
-import spacy
 
-import fasttext
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,18 +24,15 @@ from torch.nn import CrossEntropyLoss
 from torch.utils.data import DataLoader
 from torch.utils.data import DistributedSampler
 from torch.utils.data import RandomSampler
-from torch.autograd import Variable
 from tqdm import tqdm
 from transformers.tokenization_gpt2 import GPT2Tokenizer
 from transformers.tokenization_openai import OpenAIGPTTokenizer
 from model.seq2seq import TransformerSeq2Seq
 from model.seq2seq_vocab import Seq2seqTokenizer
-from copy import deepcopy
 
 from .loss import LabelSmoothingLoss
 from .optim import Adam
 from .optim import NoamOpt
-from .transformer_model import apex_model
 from .transformer_model import TransformerModel
 from .utils import pad_sequence
 from .utils import repeat_along_dim1

@@ -1,12 +1,18 @@
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
-from model.common_layer import EncoderLayer, DecoderLayer, MultiHeadAttention, Conv, PositionwiseFeedForward, LayerNorm, \
-    _gen_bias_mask ,_gen_timing_signal, share_embedding, LabelSmoothing, NoamOpt, _get_attn_subsequent_mask,  \
-    get_input_from_batch, get_output_from_batch
+
+from model.common_layer import _gen_bias_mask
+from model.common_layer import _gen_timing_signal
+from model.common_layer import _get_attn_subsequent_mask
+from model.common_layer import DecoderLayer
+from model.common_layer import EncoderLayer
+from model.common_layer import LabelSmoothing
+from model.common_layer import LayerNorm
 from .utils import repeat_along_dim1
-from .loss import SoftCrossEntropyLoss
+
 
 class Encoder(nn.Module):
     """

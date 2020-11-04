@@ -15,25 +15,25 @@
 # limitations under the License.
 """PyTorch OpenAI GPT-2 model."""
 
-import datetime
 import logging
 import math
 import os
-import pickle
 import random
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
-
-from copy import deepcopy
 from transformers.activations import gelu_new
 from transformers.configuration_gpt2 import GPT2Config
-from transformers.file_utils import add_start_docstrings, add_start_docstrings_to_callable
-from transformers.modeling_utils import Conv1D, PreTrainedModel, SequenceSummary, prune_conv1d_layer
-from .utils import repeat_along_dim1
-from .loss import SoftCrossEntropyLoss
+from transformers.file_utils import add_start_docstrings
+from transformers.file_utils import add_start_docstrings_to_callable
+from transformers.modeling_utils import Conv1D
+from transformers.modeling_utils import PreTrainedModel
+from transformers.modeling_utils import prune_conv1d_layer
+from transformers.modeling_utils import SequenceSummary
 
+from .utils import repeat_along_dim1
 
 logger = logging.getLogger(__name__)
 

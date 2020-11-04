@@ -1,15 +1,14 @@
 ### MOSTO OF IT TAKEN FROM https://github.com/kolloldas/torchnlp
 ## MINOR CHANGES
-import copy
+import math
+import pprint
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
-import torch.nn.init as I
-import numpy as np
-import math
-import pprint
 from tqdm import tqdm
+
 pp = pprint.PrettyPrinter(indent=1)
 
 class EncoderLayer(nn.Module):
