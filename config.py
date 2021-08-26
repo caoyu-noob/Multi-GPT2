@@ -71,9 +71,8 @@ def get_trainer_config(args):
                        'label_smoothing': args.label_smoothing,
                        'clip_grad': args.clip_grad,
                        'test_period': 1,
-                       'seed': 0,
+                       'seed': args.seed,
                        'device': 'cuda',
-                       'zero_shot': args.zero_shot,
                        'persona_augment': args.persona_augment,
                        'persona_aug_syn_proba': args.persona_aug_syn_proba,
                        'apex_loss_scale': args.apex_loss_scale, # e.g. '128', 'dynamic'
@@ -83,7 +82,6 @@ def get_trainer_config(args):
                        'limit_train_size': args.limit_train_size,
                        'risk_metric': args.risk_metric,
                        'load_last': args.load_last, #./checkpoints/last_checkpoint',  # Now that we save several experiments you can put the path of the checpoint file you want to load here
-                       'load_alpha_last': args.load_alpha_last,
                        'repo_id': str(repo),
                        'repo_sha': str(repo.head.object.hexsha),
                        'repo_branch': str(repo.active_branch),
@@ -91,6 +89,9 @@ def get_trainer_config(args):
                        'last_checkpoint_path': 'last_checkpoint',  # there are now in the ./runs/XXX/ experiments folders
                        'eval_references_file': 'eval_references_file',
                        'eval_predictions_file': 'eval_predictions_file',
+                       'test_references_file': 'test_references_file',
+                       'test_predictions_file_best': 'test_predictions_file_best',
+                       'test_predictions_file_last': 'test_predictions_file_last',
                        'interrupt_checkpoint_path': 'interrupt_checkpoint',  # there are now in the ./runs/XXX/ experiments folders
                        'train_datasets': args.train_datasets,
                        'train_datasets_cache': args.train_datasets_cache,
@@ -101,12 +102,16 @@ def get_trainer_config(args):
                        'full_input': args.full_input,
                        'single_input': args.single_input,
                        'max_history_size': args.max_history_size,
+                       'model_saving_interval': args.model_saving_interval,
+                       'patience': args.patience,
+                       'data_type': args.data_type,
+                       'ignore_train_indices': None,
                        })
 
     local_config = deepcopy(config)
     local_config.train_batch_size = 16
     local_config.batch_split = 2
-    local_config.test_batch_size = 3
+    local_config.test_batch_size = 4
     local_config.n_jobs = 0
     local_config.device = 'cpu'
     local_config.risk_weight = 0
@@ -120,10 +125,10 @@ def get_trainer_config(args):
 class InputConfig():
     def __init__(self):
         parser = argparse.ArgumentParser()
+        parser.add_argument('--seed', type=int, default=0)
         parser.add_argument('--normalize_embeddings', action='store_true')
         parser.add_argument('--beam_size', default=3, type=int)
-        parser.add_argument('--inference_mode', default='beam', type=str, help='You can use beam search(beam) or top-k '
-                           'sampling(sampling) during inference')
+        parser.add_argument('--inference_mode', default='beam', type=str)
         parser.add_argument('--response_k', default=1, type=int)
         parser.add_argument('--diversity_coef', default=0, type=int)
         parser.add_argument('--lr', default=6.25e-5, type=float)
@@ -132,10 +137,6 @@ class InputConfig():
         parser.add_argument('--diversity_groups', default=1, type=int)
         parser.add_argument('--annealing_topk', default=None, type=int)
         parser.add_argument('--annealing', default=0, type=float)
-        parser.add_argument('--single_input', action='store_true', help='activate this item means the input is the '
-                            'concatenation of all information instead of treat them separately (TransferTransfo or '
-                            'SI-GPT2 mentioned in the paper). Otherwise it will be the Encoder-decoder architecture'
-                            'with multiple separate inputs. (Seq2seq must activate this item)')
         parser.add_argument('--length_penalty', default=0.6, type=float)
         parser.add_argument('--bs_temperature', default=1, type=float)
         parser.add_argument('--bs_nucleus_p', default=0, type=float)
@@ -145,12 +146,15 @@ class InputConfig():
         parser.add_argument('--successive_attention', action='store_true')
         parser.add_argument('--sparse_embeddings', default=False, type=bool)
         parser.add_argument('--dialog_embeddings', default=True, type=bool)
+        parser.add_argument('--single_input', action='store_true')
         parser.add_argument('--no_persona', action='store_true')
         parser.add_argument('--use_start_end', action='store_true')
         parser.add_argument('--persona_augment', action='store_true')
         parser.add_argument('--linear_schedule', default=True, type=bool)
         parser.add_argument('--evaluate_full_sequences', default=True, type=bool)
         parser.add_argument('--n_epochs', default=5, type=int)
+        parser.add_argument('--patience', default=-1, type=int, help="the training patience if the dev result "
+                                                                     "does not promote then training ends")
         parser.add_argument('--train_batch_size', default=256, type=int)
         parser.add_argument('--batch_split', default=32, type=int)
         parser.add_argument('--test_batch_size', default=8, type=int)
@@ -159,7 +163,8 @@ class InputConfig():
         parser.add_argument('--lm_weight', default=1, type=float)
         parser.add_argument('--risk_weight', default=0, type=float)
         parser.add_argument('--hits_weight', default=0, type=float)
-        parser.add_argument('--label_smoothing', default=0.1, type=float)
+        parser.add_argument('--label_smoothing', default=-1, type=float,
+                            help='Config for Seq2Seq model, whether use label smoothing loss, -1 means no smoothing')
         parser.add_argument('--negative_samples', default=0, type=int)
         parser.add_argument('--persona_aug_syn_proba', default=0, type=float)
         parser.add_argument('--apex_loss_scale', default=None, type=str)
@@ -169,6 +174,7 @@ class InputConfig():
         parser.add_argument('--load_last', default='', type=str)
         parser.add_argument('--load_alpha_last', default='', type=str)
         parser.add_argument('--data_type', default='persona', type=str, help='data set types, persona/emoji/daily')
+        parser.add_argument('--test_data_type', default=None, type=str, help='data set types, persona/emoji/daily')
         parser.add_argument('--emb_dim', default=300, type=int, help='Config for Seq2Seq model')
         parser.add_argument('--hidden_dim', default=300, type=int, help='Config for Seq2Seq model')
         parser.add_argument('--num_layers', default=6, type=int, help='Config for Seq2Seq model')
@@ -178,6 +184,7 @@ class InputConfig():
         parser.add_argument('--pointer_gen', action='store_true', help='Config for Seq2Seq model')
         parser.add_argument('--pretrained_emb_file', default='./glove/glove.6B.300d.txt', type=str)
         parser.add_argument('--vocab_path', default='./datasets/persona_vocab.bin', type=str)
+        parser.add_argument('--extend_exist_vocab', default=None, type=str)
         parser.add_argument('--train_datasets', default='datasets/ConvAI2/train_self_original.txt', type=str)
         parser.add_argument('--valid_datasets', default='datasets/ConvAI2/valid_self_original.txt', type=str)
         parser.add_argument('--test_datasets', default='datasets/ConvAI2/test_self_original.txt', type=str)
@@ -191,16 +198,13 @@ class InputConfig():
         parser.add_argument('--same_embedding_lm', type=int, default=1, help='the embedding in transformer and the '
                                                                              'weight in the lm are the same')
         parser.add_argument('--uncertainty_loss', action='store_true', help='whether use uncertainty loss')
-        parser.add_argument('--model_type', type=str, default='gpt2', help='gpt for OpenAI GPT model, gpt2 for GPT2 '
-                           'model and seq2seq for Transformer-based seq2seq model')
-        parser.add_argument('--shared_module', type=int, default=0, help='0 means the weights between encoder and '
-                             'decoder will not be shared while 1 means sharing weights')
-        parser.add_argument('--shared_attention', type=int, default=0, help='0 means the weights between different '
-                            'attentions in the decoder will not be shared while 1 means sharing weights')
+        parser.add_argument('--model_type', type=str, default='gpt2', help='gpt/gpt2/se2seq/rnn-seq2seq')
+        parser.add_argument('--model_saving_interval', type=int, default=10, help='model saving interval for seq2seq')
+        parser.add_argument('--shared_module', type=int, default=1)
+        parser.add_argument('--shared_attention', type=int, default=1)
         parser.add_argument('--attention_fusion_type', type=str, default='mean', help='the method to pool attention '
                 'output from different source(mean/min/max/sw/dw/linear/att) '
                 'sw=source level weight, dw=dimension level weight, linear=linear transform for concatenating,'
-                'dw=source and dimensional level weight, dw=dimension level weight, linear=linear transform for concatenating,'
                 'att=extra transformer attention layer to fuse attention output,'
                 'dys=dynamic determine the scalar weight for each source by a linear layer'
                 'dyd=dynamic determine the vector weight for each dimension for each source by a linear layer'
