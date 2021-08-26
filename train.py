@@ -64,67 +64,7 @@ def modify_tokenizer(tokenizer, data_type):
     tokenizer.talker2_eos_id = tokenizer.added_tokens_encoder['<talker2_eos>']
     return tokenizer, len(additional_special_tokens) + 3
 
-def main():
-    args = InputConfig().args
-
-    logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                        datefmt = '%m/%d/%Y %H:%M:%S',
-                        level = logging.INFO if args.local_rank in [-1, 0] else logging.ERROR)
-    logger = logging.getLogger(__file__)
-    if args.server_ip and args.server_port and args.local_rank in [-1, 0]:
-        # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
-        import ptvsd
-        print("Waiting for debugger attach")
-        ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
-        ptvsd.wait_for_attach()
-
-    trainer_config = get_trainer_config(args)
-    # with open('/apdcephfs/share_916081/rainyucao/transformer_chatbot_experiments/test_log', 'w') as f:
-    #     a = []
-    #     a.append('args local rank is ' + str(args.local_rank) + '\n')
-    #     a.append('cuda count' + str(torch.cuda.device_count()) + '\n')
-    #     if args.local_rank not in [-1, 0] and torch.cuda.device_count() == 1:
-    #         args.local_rank = -1
-    #     a.append('args local rank is ' + str(args.local_rank) + '\n')
-    #     f.writelines(a)
-
-    # Log only on main process
-    if args.local_rank not in [-1, 0]:
-        sys.stdout = open("./runs/log_distributed_{}".format(args.local_rank), "w")  # dump sdtout
-        writer = DummyWriter()
-        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
-                            datefmt='%m/%d/%Y %H:%M:%S', level=logging.ERROR)
-        logger = logging.getLogger(__file__)
-    else:
-        from datetime import datetime
-        current_time = datetime.now().strftime('%b%d_%H-%M-%S')
-        if args.single_input:
-            comment = '_{}_{}_single'.format(args.model_type, args.data_type)
-        else:
-            if args.model_type == 'seq2seq':
-                comment = '_seq2seq_multi_{}_{}'.format(args.data_type, args.attention_fusion_type)
-            else:
-                comment = '_{}_{}_{}_{}_{}'.format(args.model_type, args.data_type, args.attention_fusion_type,
-                           ('sm' if args.shared_module == 1 else 'nm'), ('sa' if args.shared_attention == 1 else 'na'))
-        logdir = os.path.join('runs', current_time + comment)
-        writer = SummaryWriter(logdir=logdir)
-        logger = config_logger(os.path.join(logdir, 'train.log'))
-
-    log_dir = writer.logdir
-    logger.info("Training args: {}".format(args))
-    logger.info("trainer config: {}".format(trainer_config))
-    interrupt_checkpoint_path = os.path.join(log_dir, trainer_config.interrupt_checkpoint_path)
-    last_checkpoint_path = os.path.join(log_dir, trainer_config.last_checkpoint_path)
-    best_checkpoint_path = os.path.join(log_dir, 'best_model')
-    logger.info("Logging to {}".format(log_dir))  # Let's save everything on an experiment in the ./runs/XXX/directory
-    if args.local_rank in [-1, 0]:
-        with open(os.path.join(log_dir, "trainer_config.json"), "w") as f:
-            json.dump(trainer_config, f)
-
-    set_seed(trainer_config.seed)
-    device = torch.device(trainer_config.device)
-
-    parsed_train_data, parsed_valid_data, parsed_test_data = None, None, None
+def get_model_and_tokenizer(args, trainer_config, logger):
     if args.model_type == 'gpt':
         if args.single_input:
             model = OpenAIGPTLMHeadModel.from_pretrained('./openai-gpt')
@@ -139,22 +79,24 @@ def main():
         tokenizer = GPT2Tokenizer.from_pretrained('./dialogpt')
     elif args.model_type == 'seq2seq':
         seq2seq_vocab = Seq2seqVocab(trainer_config.train_datasets, trainer_config.valid_datasets,
-                                 trainer_config.test_datasets, args.vocab_path, data_type=args.data_type)
+                                     trainer_config.test_datasets, args.vocab_path, data_type=trainer_config.data_type,
+                                     extend_exist_vocab=args.extend_exist_vocab)
         tokenizer = seq2seq_vocab.vocab
-        parsed_train_data, parsed_valid_data, parsed_test_data = seq2seq_vocab.all_data[0], seq2seq_vocab.all_data[1], \
-                                                                 seq2seq_vocab.all_data[2]
         args.dialog_embeddings = False
         model = TransformerSeq2Seq(args.emb_dim, args.hidden_dim, args.num_layers, args.heads, args.depth_size,
                                args.filter_size, tokenizer, args.pretrained_emb_file, args.pointer_gen, logger,
-                                multi_input=not args.single_input, attention_fusion_type=args.attention_fusion_type)
+                                multi_input=not args.single_input, attention_pooling_type=args.attention_pooling_type,
+                                label_smoothing=args.label_smoothing)
     else:
         if args.single_input:
             model = GPT2DoubleHeadsModel.from_pretrained('./gpt2-small')
         else:
             model = GPT2EncoderDecoderModel.from_pretrained('./gpt2-small')
         tokenizer = GPT2Tokenizer.from_pretrained('./gpt2-small')
+    return model, tokenizer
 
-
+'''Modify the model to make it fit the data'''
+def modify_model(args, model, tokenizer):
     if args.model_type in ['gpt', 'dialogpt', 'gpt2']:
         tokenizer, additional_length = modify_tokenizer(tokenizer, args.data_type)
         model.embeddings_size = 768
@@ -204,6 +146,9 @@ def main():
     model.inference_mode = args.inference_mode
     model.response_k = args.response_k
 
+def training_procedure(args, trainer_config, model, tokenizer, device, writer, logger, best_checkpoint_path,
+                       last_checkpoint_path, interrupt_checkpoint_path, log_dir, test_data_type=None):
+    logger.info("trainer config: {}".format(trainer_config))
     logger.info('loading datasets')
     train_dataset = FacebookDataset(trainer_config.train_datasets, tokenizer,
                                     max_lengths=model.n_pos_embeddings - 1,  # A bit restrictive here
@@ -216,8 +161,7 @@ def main():
                                     limit_size=trainer_config.limit_train_size,
                                     max_history_size=trainer_config.max_history_size,
                                     single_input=args.single_input,
-                                    data_type=args.data_type,
-                                    parsed_data=parsed_train_data)
+                                    data_type=trainer_config.data_type)
     valid_dataset = FacebookDataset(trainer_config.valid_datasets, tokenizer,
                                     max_lengths=model.n_pos_embeddings - 1,  # A bit restrictive here
                                     dialog_embeddings=args.dialog_embeddings,
@@ -229,8 +173,9 @@ def main():
                                     limit_size=trainer_config.limit_eval_size,
                                     max_history_size=trainer_config.max_history_size,
                                     single_input=args.single_input,
-                                    data_type=args.data_type,
-                                    parsed_data=parsed_valid_data)
+                                    data_type=trainer_config.data_type)
+    if test_data_type is None:
+        test_data_type = trainer_config.data_type
     test_dataset = FacebookDataset(trainer_config.test_datasets, tokenizer,
                                    max_lengths=model.n_pos_embeddings - 1,  # A bit restrictive here
                                    dialog_embeddings=args.dialog_embeddings,
@@ -242,72 +187,48 @@ def main():
                                    limit_size=trainer_config.limit_eval_size,
                                    max_history_size=trainer_config.max_history_size,
                                    single_input=args.single_input,
-                                   data_type=args.data_type,
-                                   parsed_data=parsed_test_data)
+                                   data_type=test_data_type)
     logger.info('train dataset {} valid dataset {} test dataset {}'
                 .format(len(train_dataset), len(valid_dataset), len(test_dataset)))
 
-    # if args.local_rank != -1:
-    #     os.environ['MASTER_ADDR'] = 'localhost'
-    #     os.environ['MASTER_PORT'] = '12355'
-    #
-    #     # initialize the process group
-    #     torch.distributed.init_process_group("nccl", rank=args.local_rank, world_size=1)
-    #     n = torch.cuda.device_count()
-    #     device_ids = list(range(args.local_rank * n, (args.local_rank + 1) * n))
-    #     torch.cuda.set_device(args.local_rank)
-    #     device = torch.device('cuda', args.local_rank)
-    #     transformer.distribute(device_ids[0], device_ids)
     '''Normal training will use normal trainer'''
     model_trainer = Trainer(model,
                             train_dataset,
+                            trainer_config,
                             writer,
                             logger=logger,
                             valid_dataset=valid_dataset,
                             test_dataset=test_dataset,
-                            train_batch_size=trainer_config.train_batch_size,
-                            batch_split=trainer_config.batch_split,
-                            test_batch_size=trainer_config.test_batch_size,
-                            lr=trainer_config.lr,
-                            lr_warmup=trainer_config.lr_warmup,
-                            weight_decay=trainer_config.weight_decay,
-                            s2s_weight=trainer_config.s2s_weight,
-                            lm_weight=trainer_config.lm_weight,
-                            risk_weight=trainer_config.risk_weight,
-                            hits_weight=trainer_config.hits_weight,
-                            single_input=trainer_config.single_input,
                             n_jobs=trainer_config.n_jobs,
-                            clip_grad=trainer_config.clip_grad,
                             device=device,
                             ignore_idxs=tokenizer.all_special_ids,
                             local_rank=args.local_rank,
                             apex_level=None,
                             apex_loss_scale=trainer_config.apex_loss_scale,
-                            linear_schedule=trainer_config.linear_schedule,
-                            n_epochs=trainer_config.n_epochs,
                             evaluate_full_sequences=trainer_config.evaluate_full_sequences,
                             full_input=trainer_config.full_input,
                             uncertainty_loss=args.uncertainty_loss,
                             best_model_path=best_checkpoint_path,
-                            extra_module_lr_rate=args.extra_module_lr_rate,
-                            no_persona=args.no_persona)
+                            extra_module_lr_rate=args.extra_module_lr_rate)
 
     if args.load_last:
         state_dict = torch.load(trainer_config.load_last, map_location=device)
         model_trainer.load_state_dict(state_dict)
 
     # helpers -----------------------------------------------------
-    def external_metrics_func(full_references, full_predictions, epoch, metric=None, is_best=False):
+    def external_metrics_func(full_references, full_predictions, epoch, is_best=False):
         if epoch == -1:
             if is_best:
-                references_file_path = os.path.join(writer.logdir, 'test_references_file')
-                predictions_file_path = os.path.join(writer.logdir, 'test_predictions_file_best')
+                references_file_path = os.path.join(writer.logdir, trainer_config.test_references_file)
+                predictions_file_path = os.path.join(writer.logdir,  trainer_config.test_predictions_file_best)
             else:
-                references_file_path = os.path.join(writer.logdir, 'test_references_file')
-                predictions_file_path = os.path.join(writer.logdir, 'test_predictions_file_last')
+                references_file_path = os.path.join(writer.logdir, trainer_config.test_references_file)
+                predictions_file_path = os.path.join(writer.logdir, trainer_config.test_predictions_file_last)
         else:
             references_file_path = os.path.join(writer.logdir, trainer_config.eval_references_file)
-            predictions_file_path = os.path.join(writer.logdir, trainer_config.eval_predictions_file + "_{}".format(epoch))
+            predictions_file_path = os.path.join(writer.logdir,
+                                                 trainer_config.eval_predictions_file + "_{}".format(epoch))
+
         if not os.path.exists(references_file_path):
             with open(references_file_path, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(full_references))
@@ -320,14 +241,20 @@ def main():
             f.write('\n'.join(full_predictions))
 
         bleu, bleu_list, nist, nist_list, nist_bleu, nist_bleu_list, s_dist, c_dist, entropy, meteor, \
-                rouge_l, f1_score, avg_length = nlp_metrics(references_file_path, predictions_file_path, root_path=log_dir)
+        rouge_l, f1_score, avg_length = nlp_metrics(references_file_path, predictions_file_path, root_path=log_dir)
 
-        metrics = {'meteor': meteor, 'avg_len': avg_length, 'rouge-l': rouge_l, 'bleu': bleu, 'nist': nist,
-                   'nist-bleu': nist_bleu, 'f1': f1_score}
-        for name, metric in (('bleu', bleu_list), ('nist', nist_list), ('nist_bleu', nist_bleu_list), ('entropy', entropy),
-                             ('sentence_div', s_dist), ('corpus_div', c_dist)):
+        metrics = {'meteor': meteor * 100, 'avg_len': avg_length, 'rouge-l': rouge_l * 100, 'bleu': bleu, 'nist': nist,
+                   'nist-bleu': nist_bleu, 'f1': f1_score * 100}
+        for name, metric in (
+        ('bleu', bleu_list), ('nist', nist_list), ('nist_bleu', nist_bleu_list), ('entropy', entropy),
+        ('sentence_div', s_dist), ('corpus_div', c_dist)):
             for i, m in enumerate(metric, 1):
-                metrics['{}_{}'.format(name, i)] = m
+                if name == 'sentence_div' or name == 'corpus_div':
+                    metrics['{}_{}'.format(name, i)] = m * 100
+                else:
+                    metrics['{}_{}'.format(name, i)] = m
+        for k, v in metrics.items():
+            metrics[k] = round(v, 6)
 
         return metrics
 
@@ -342,7 +269,8 @@ def main():
         samples_idxs = random.sample(range(len(valid_dataset)), n_samples)
         samples = [valid_dataset[idx] for idx in samples_idxs]
         for persona_info, dialog, target, _ in samples:
-            contexts = [torch.tensor([c], dtype=torch.long, device=model_trainer.device) for c in [persona_info, dialog] if len(c) > 0]
+            contexts = [torch.tensor([c], dtype=torch.long, device=model_trainer.device) for c in [persona_info, dialog]
+                        if len(c) > 0]
             prediction = model_trainer.model.predict(contexts)[0]
 
             persona_info_str = tokenizer.ids2string(persona_info[1:-1])
@@ -359,7 +287,7 @@ def main():
             logger.info('Prediction:\n\t{}'.format(prediction_str))
 
     def test_func(epoch):
-        if (epoch+1) % trainer_config.test_period == 0:
+        if (epoch + 1) % trainer_config.test_period == 0:
             metric_funcs = {'f1_score': f1_score}
             model_trainer.test(metric_funcs, external_metrics_func, epoch)
 
@@ -372,10 +300,12 @@ def main():
         """ risk_metric selected in:
             f1, meteor, avg_len, nist_{1, 2, 3, 4}, entropy_{1, 2, 3, 4}, div_{1, 2}, bleu_{1, 2, 3, 4}
         """
+
         def external_metric_risk(predictions, targets):
             string_targets = list(tokenizer.ids2string(t) for t in targets)
             string_predictions = list(tokenizer.ids2string(t) for t in predictions)
-            metrics = [external_metrics_func([t], [p], epoch=-1, metric=risk_metric) for p, t in zip(string_predictions, string_targets)]
+            metrics = [external_metrics_func([t], [p], epoch=-1, metric=risk_metric) for p, t in
+                       zip(string_predictions, string_targets)]
 
             if any([s in risk_metric for s in ['entropy', 'nist', 'avg_len']]):
                 return [-m for m in metrics]
@@ -399,6 +329,62 @@ def main():
             torch.save(model_trainer.state_dict(), interrupt_checkpoint_path)
         raise e
 
+def main():
+    args = InputConfig().args
+
+    logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                        datefmt = '%m/%d/%Y %H:%M:%S',
+                        level = logging.INFO if args.local_rank in [-1, 0] else logging.ERROR)
+    if args.server_ip and args.server_port and args.local_rank in [-1, 0]:
+        # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
+        import ptvsd
+        print("Waiting for debugger attach")
+        ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
+        ptvsd.wait_for_attach()
+
+    trainer_config = get_trainer_config(args)
+
+    # Log only on main process
+    if args.local_rank not in [-1, 0]:
+        sys.stdout = open("./runs/log_distributed_{}".format(args.local_rank), "w")  # dump sdtout
+        writer = DummyWriter()
+        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+                            datefmt='%m/%d/%Y %H:%M:%S', level=logging.ERROR)
+        logger = logging.getLogger(__file__)
+    else:
+        from datetime import datetime
+        current_time = datetime.now().strftime('%b%d_%H-%M-%S')
+        if args.single_input:
+            comment = '_{}_{}_single'.format(args.model_type, args.data_type)
+        else:
+            if args.model_type == 'seq2seq':
+                comment = '_seq2seq_multi_{}_{}'.format(args.data_type, args.attention_fusion_type)
+            else:
+                comment = '_{}_{}_{}_{}_{}'.format(args.model_type, args.data_type, args.attention_fusion_type,
+                           ('sm' if args.shared_module == 1 else 'nm'), ('sa' if args.shared_attention == 1 else 'na'))
+        logdir = os.path.join('runs', current_time + comment)
+        writer = SummaryWriter(logdir=logdir)
+        logger = config_logger(os.path.join(logdir, 'train.log'))
+
+    log_dir = writer.logdir
+    logger.info("Training args: {}".format(args))
+    interrupt_checkpoint_path = os.path.join(log_dir, trainer_config.interrupt_checkpoint_path)
+    last_checkpoint_path = os.path.join(log_dir, trainer_config.last_checkpoint_path)
+    best_checkpoint_path = os.path.join(log_dir, 'best_model')
+    logger.info("Logging to {}".format(log_dir))  # Let's save everything on an experiment in the ./runs/XXX/directory
+    if args.local_rank in [-1, 0]:
+        with open(os.path.join(log_dir, "trainer_config.json"), "w") as f:
+            json.dump(trainer_config, f)
+
+    set_seed(trainer_config.seed)
+    device = torch.device(trainer_config.device)
+
+    model, tokenizer = get_model_and_tokenizer(args, trainer_config, logger)
+    logger.info('Load tokenizer, vocab size is %d', tokenizer.vocab_size if hasattr(tokenizer, 'vocab_size') else
+            tokenizer.n_words)
+    modify_model(args, model, tokenizer)
+    training_procedure(args, trainer_config, model, tokenizer, device, writer, logger, best_checkpoint_path,
+                       last_checkpoint_path, interrupt_checkpoint_path, log_dir, test_data_type=args.test_data_type)
 
 if __name__ == '__main__':
     main()

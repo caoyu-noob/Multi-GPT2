@@ -19,20 +19,16 @@ import logging
 import math
 import os
 import random
-from copy import deepcopy
 
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
+
+from copy import deepcopy
 from transformers.activations import gelu_new
 from transformers.configuration_gpt2 import GPT2Config
-from transformers.file_utils import add_start_docstrings
-from transformers.file_utils import add_start_docstrings_to_callable
-from transformers.modeling_utils import Conv1D
-from transformers.modeling_utils import PreTrainedModel
-from transformers.modeling_utils import prune_conv1d_layer
-from transformers.modeling_utils import SequenceSummary
-
+from transformers.file_utils import add_start_docstrings, add_start_docstrings_to_callable
+from transformers.modeling_utils import Conv1D, PreTrainedModel, SequenceSummary, prune_conv1d_layer
 from .utils import repeat_along_dim1
 
 logger = logging.getLogger(__name__)
@@ -493,7 +489,6 @@ class GPT2Model(GPT2PreTrainedModel):
         super().__init__(config)
         self.output_hidden_states = config.output_hidden_states
         self.output_attentions = config.output_attentions
-        self.output_past = config.output_past
 
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.wpe = nn.Embedding(config.n_positions, config.n_embd)
@@ -654,8 +649,8 @@ class GPT2Model(GPT2PreTrainedModel):
             )
 
             hidden_states, present = outputs[:2]
-            if self.output_past:
-                presents = presents + (present,)
+            # if self.output_past:
+            presents = presents + (present,)
 
             if self.output_attentions:
                 all_attentions.append(outputs[2])
@@ -668,8 +663,8 @@ class GPT2Model(GPT2PreTrainedModel):
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         outputs = (hidden_states,)
-        if self.output_past:
-            outputs = outputs + (presents,)
+        # if self.output_past:
+        outputs = outputs + (presents,)
         if self.output_hidden_states:
             outputs = outputs + (all_hidden_states,)
         if self.output_attentions:
@@ -966,7 +961,7 @@ class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
 
             beam_scores = torch.zeros(batch_size, self.beam_size, device=device)
             beam_lens = torch.ones(batch_size, self.beam_size, dtype=torch.long, device=device)
-            is_end = torch.zeros(batch_size, self.beam_size, dtype=torch.uint8, device=device)
+            is_end = torch.zeros(batch_size, self.beam_size, dtype=torch.bool, device=device)
 
             current_sample_prob = 1
             group_size = self.beam_size // self.diversity_groups
@@ -1428,7 +1423,7 @@ class GPT2EncoderDecoderModel(GPT2PreTrainedModel):
                 prevs = torch.full((batch_size, 1), fill_value=self.bos_id, dtype=torch.long, device=device)
                 sample_scores = torch.zeros(batch_size, 1, device=device)
                 lens = torch.ones(batch_size, 1, dtype=torch.long, device=device)
-                is_end = torch.zeros(batch_size, 1, dtype=torch.uint8, device=device)
+                is_end = torch.zeros(batch_size, 1, dtype=torch.bool, device=device)
                 max_seq_len = min(
                     self.n_pos_embeddings - prevs.shape[1] - (beam_starts.shape[1] if beam_starts is not None else 0),
                     self.max_seq_len)
@@ -1472,7 +1467,7 @@ class GPT2EncoderDecoderModel(GPT2PreTrainedModel):
 
             beam_scores = torch.zeros(batch_size, self.beam_size, device=device)
             beam_lens = torch.ones(batch_size, self.beam_size, dtype=torch.long, device=device)
-            is_end = torch.zeros(batch_size, self.beam_size, dtype=torch.uint8, device=device)
+            is_end = torch.zeros(batch_size, self.beam_size, dtype=torch.bool, device=device)
 
             if beam_starts is not None:
                 beam_starts = repeat_along_dim1(beam_starts, self.beam_size)

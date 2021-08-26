@@ -41,13 +41,11 @@ SPECIAL_TOKENS = ['<bos>', '<eos>', '<pad>', '<talker1_bos>', '<talker2_bos>', '
                   '<info_bos>', '<info_eos>', '.', ',', '?', '!', ':']
 
 class Trainer:
-    def __init__(self, model, train_dataset, writer, logger=None, test_dataset=None, valid_dataset=None, train_batch_size=8,
-                 test_batch_size=8, batch_split=1, s2s_weight=1, lm_weight=0.5, risk_weight=0, hits_weight=0,
-                 lr=6.25e-5, lr_warmup=2000, n_jobs=0, clip_grad=None, label_smoothing=0, device=torch.device('cuda'),
-                 weight_decay=0.1, ignore_idxs=[], local_rank=-1, apex_level=None, apex_loss_scale=None,
-                 linear_schedule=False, n_epochs=0, single_input=False, evaluate_full_sequences=False, full_input=False,
-                 max_length=511, uncertainty_loss=False, new_dataset=False, best_model_path='', extra_module_lr_rate=1,
-                 no_persona=False):
+    def __init__(self, model, train_dataset, trainer_config, writer, logger=None, test_dataset=None, valid_dataset=None,
+                 n_jobs=0, label_smoothing=0, device=torch.device('cuda'), ignore_idxs=[], local_rank=-1,
+                 apex_level=None, apex_loss_scale=None, evaluate_full_sequences=False, full_input=False,
+                 max_length=511, max_y_length=80, uncertainty_loss=False, new_dataset=False, best_model_path='',
+                 extra_module_lr_rate=1, no_persona=False, pointer_gen=False):
         n_gpu = torch.cuda.device_count()
         if logger is None:
             self.logger = logging.getLogger(__file__)
@@ -55,6 +53,42 @@ class Trainer:
             self.logger = logger
         self.logger.info("device: {}, distributed training: {}, apex_level: {}, apex_scale_loss: {},  n_gpu: {}".format(
             device, bool(local_rank != -1), apex_level, apex_loss_scale, n_gpu))
+
+        self.train_batch_size = trainer_config.train_batch_size
+        self.test_batch_size = trainer_config.test_batch_size
+        self.lr = trainer_config.lr
+        self.lr_warmup = trainer_config.lr_warmup
+        self.weight_decay = trainer_config.weight_decay
+        self.batch_split = trainer_config.batch_split
+        self.s2s_weight = trainer_config.s2s_weight
+        self.lm_weight = trainer_config.lm_weight
+        self.risk_weight = trainer_config.risk_weight
+        self.hits_weight = trainer_config.hits_weight
+        self.single_input = trainer_config.single_input
+        self.clip_grad = trainer_config.clip_grad
+        self.n_epochs = trainer_config.n_epochs
+        self.linear_schedule = trainer_config.linear_schedule
+        self.patience = trainer_config.patience
+        self.model_saving_interval = trainer_config.model_saving_interval
+        self.device = device
+        self.ignore_idxs = ignore_idxs
+        self.apex_level = apex_level
+        self.no_persona = no_persona
+        self.evaluate_full_sequences = evaluate_full_sequences
+        self.global_step = 0
+        self.local_rank = local_rank
+        self.full_input = full_input
+        self.max_length = max_length
+        self.max_y_length = max_y_length
+        self.new_dataset = new_dataset
+        self.best_ppl = 1e5
+        self.best_model_path = best_model_path
+        if train_dataset is not None:
+            self.negative_samples = train_dataset.negative_samples
+        self.model_type = 'pretrain'
+        self.patience_cnt = 0
+        self.stop_training = False
+        self.pointer_gen = pointer_gen
 
         self.model = model.to(device)
         self.uncertainty_loss = uncertainty_loss
@@ -67,7 +101,7 @@ class Trainer:
         # Here we should remove parameters which are not used during to avoid breaking apex with None grads
         self.loss_weight = None
         if self.uncertainty_loss:
-            if hits_weight > 0:
+            if self.hits_weight > 0:
                 loss_weight = torch.zeros(3, device=device)
             else:
                 loss_weight = torch.zeros(2, device=device)
@@ -76,7 +110,7 @@ class Trainer:
         no_decay = ['bias', 'loss']
         if extra_module_lr_rate == 1:
             optimizer_grouped_parameters = [
-                {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': weight_decay},
+                {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': self.weight_decay},
                 {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
                 ]
         else:
@@ -94,71 +128,47 @@ class Trainer:
                         no_decay_params.append(p)
 
             optimizer_grouped_parameters = [
-                {'params': params, 'weight_decay': weight_decay},
-                {'params': extra_params, 'weight_decay': weight_decay, 'extra': True},
+                {'params': params, 'weight_decay': self.weight_decay},
+                {'params': extra_params, 'weight_decay': self.weight_decay, 'extra': True},
                 {'params': no_decay_params, 'weight_decay': 0.0}
             ]
             if len(extra_no_decay_params) != 0:
                 optimizer_grouped_parameters.append({'params': extra_no_decay_params, 'weight_decay': 0, 'extra': True})
 
-        base_optimizer = Adam(optimizer_grouped_parameters, lr=lr)
+        base_optimizer = Adam(optimizer_grouped_parameters, lr=self.lr)
         assert local_rank == -1 or apex_level is None, 'Distributed model with apex optimization is not supported right now.'
         # self.model, base_optimizer = apex_model(self.model, optimizer=base_optimizer,
         #                                         apex_level=apex_level, apex_loss_scale=apex_loss_scale)
 
-        if not linear_schedule:
-            self.optimizer = NoamOpt(self.model.embeddings_size, lr_warmup, base_optimizer, lr=lr,
+        if not self.linear_schedule:
+            self.optimizer = NoamOpt(self.model.embeddings_size, self.lr_warmup, base_optimizer, lr=self.lr,
                                      linear_schedule=False, apex_level=apex_level, loss_weight=self.loss_weight,
                                      extra_module_lr_rate=extra_module_lr_rate)
         else:
-            total_steps = len(train_dataset) * n_epochs // train_batch_size
+            total_steps = len(train_dataset) * self.n_epochs // self.train_batch_size
             if local_rank != -1:
                 total_steps = total_steps // torch.distributed.get_world_size()
-            self.optimizer = NoamOpt(self.model.embeddings_size, lr_warmup, base_optimizer, linear_schedule=True,
-                                     lr=lr, total_steps=total_steps, apex_level=apex_level, loss_weight=self.loss_weight,
+            self.optimizer = NoamOpt(self.model.embeddings_size, self.lr_warmup, base_optimizer, linear_schedule=True,
+                                     lr=self.lr, total_steps=total_steps, apex_level=apex_level, loss_weight=self.loss_weight,
                                      extra_module_lr_rate=extra_module_lr_rate)
 
         if local_rank == -1:
             train_sampler = RandomSampler(train_dataset)
         else:
             train_sampler = DistributedSampler(train_dataset)
-        self.train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size // batch_split,
+        self.train_dataloader = DataLoader(train_dataset, batch_size=self.train_batch_size // self.batch_split,
                                            sampler=train_sampler,
                                            num_workers=n_jobs, collate_fn=self.collate_func)
-
         self.train_dataset = train_dataset  # used to sample negative examples
         if test_dataset is not None and local_rank in [-1, 0]:  # only do evaluation on main process
-            self.test_dataloader = DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False, 
+            self.test_dataloader = DataLoader(test_dataset, batch_size=self.test_batch_size, shuffle=False,
                                               num_workers=n_jobs, collate_fn=self.collate_func)
         if valid_dataset is not None and local_rank in [-1, 0]:
-            self.valid_dataloader = DataLoader(valid_dataset, batch_size=test_batch_size, shuffle=False,
+            self.valid_dataloader = DataLoader(valid_dataset, batch_size=self.test_batch_size, shuffle=False,
                                               num_workers=n_jobs, collate_fn=self.collate_func)
         self.vocab = train_dataset.vocab
         self.writer = writer
 
-        self.train_batch_size = train_batch_size
-        self.batch_split = batch_split
-        self.s2s_weight = s2s_weight
-        self.lm_weight = lm_weight
-        self.risk_weight = risk_weight
-        self.hits_weight = hits_weight
-        self.clip_grad = clip_grad
-        self.device = device
-        self.ignore_idxs = ignore_idxs
-        self.apex_level = apex_level
-        self.n_epochs = n_epochs
-        self.single_input = single_input
-        self.no_persona = no_persona
-        self.evaluate_full_sequences = evaluate_full_sequences
-        self.global_step = 0
-        self.local_rank = local_rank
-        self.full_input = full_input
-        self.max_length = max_length
-        self.new_dataset = new_dataset
-        self.best_ppl = 1e5
-        self.best_model_path = best_model_path
-        self.negative_samples = train_dataset.negative_samples
-        self.model_type = 'pretrain'
         if isinstance(self.model, TransformerSeq2Seq):
             self.model_type = 'seq2seq'
 
@@ -258,9 +268,9 @@ class Trainer:
             # Pad now so we pad correctly when we have only a single input (context concatenated with y)
         if self.single_input:
             if isinstance(y_out, tuple):
-                y_out = ([y[-(self.max_length - 1):] for y in y_out[0]], [y[-(self.max_length - 1):] for y in y_out[1]])
+                y_out = ([y[-(self.max_length - 1):] for y in y_out[0]], [y[:(self.max_y_length - 1)] for y in y_out[1]])
                 distractors = ([d[-(self.max_length - 1):] for d in distractors[0]],
-                               [d[-(self.max_length - 1):] for d in distractors[1]])
+                               [d[:(self.max_length - 1)] for d in distractors[1]])
             else:
                 y_out = [y[-(self.max_length - 1):] for y in y_out]
                 distractors = [d[-(self.max_length - 1):] for d in distractors]
@@ -323,14 +333,16 @@ class Trainer:
         lm_loss, lm_logits, mc_logits, _ = self.model(input_ids, token_type_ids=token_type_ids, lm_labels=lm_labels,
                 mc_token_ids=mc_token_ids[: cur_batch_size])
         all_mc_logits = [mc_logits.unsqueeze(-1)]
-        for i in range(self.negative_samples):
-            distractor_ids = distractors[cur_batch_size * i: cur_batch_size * (i + 1), :, 0]. contiguous()
-            distractor_type_ids = distractors[cur_batch_size * i: cur_batch_size * (i + 1), :, 1]. contiguous()
-            _, mc_logits, _ = self.model(
-                distractor_ids,
-                token_type_ids=distractor_type_ids,
-                mc_token_ids=mc_token_ids[cur_batch_size * (i + 1): cur_batch_size * (i + 2)])
-            all_mc_logits.append(mc_logits.unsqueeze(-1))
+        if distractors.size()[0] > 0:
+            for i in range(self.negative_samples):
+                distractor_ids = distractors[cur_batch_size * i: cur_batch_size * (i + 1), :, 0]. contiguous()
+                distractor_type_ids = distractors[cur_batch_size * i: cur_batch_size * (i + 1), :, 1]. contiguous()
+                distractor_mix_replace_batch = None
+                _, mc_logits, _ = self.model(
+                    distractor_ids,
+                    token_type_ids=distractor_type_ids,
+                    mc_token_ids=mc_token_ids[cur_batch_size * (i + 1): cur_batch_size * (i + 2)])
+                all_mc_logits.append(mc_logits.unsqueeze(-1))
         mc_labels = torch.zeros_like(mc_logits, dtype=torch.long)
         mc_logits = torch.cat(all_mc_logits, dim=-1)
         if self.model.training:
@@ -508,8 +520,12 @@ class Trainer:
                     input_ids, labels, lengths = targets[0].to(self.device), targets[1].to(self.device), contexts
                     input_ids_replace, labels_replace = None, None,
                     loss = self.model(input_ids, labels, input_ids_replace, labels_replace)
-                    full_loss = (loss / self.batch_split, )
-                    s2s_loss = (i * s2s_loss + loss.item()) / (i + 1)
+                    if isinstance(loss, tuple):
+                        full_loss = (loss[0] / self.batch_split, )
+                        s2s_loss = (i * s2s_loss + loss[1].item()) / (i + 1)
+                    else:
+                        full_loss = (loss / self.batch_split, )
+                        s2s_loss = (i * s2s_loss + loss.item()) / (i + 1)
                     tqdm_data.set_postfix({'s2s_loss': s2s_loss})
                 else:
                     targets, distractors, lengths = targets.to(self.device), distractors.to(self.device), contexts
@@ -524,14 +540,131 @@ class Trainer:
             # optimization
             full_loss = tuple(filter(lambda x: x.requires_grad, full_loss))
             full_loss = self.optimizer.backward(full_loss)
-
+            if self.pointer_gen and (torch.isnan(self.model.generator.p_gen_linear._parameters['weight']._grad[0][0]) or \
+                torch.isinf(self.model.generator.p_gen_linear._parameters['weight']._grad[0][0])):
+                self.optimizer.zero_grad()
+                self.logger.info('Abnormal gradient')
             if (i + 1) % self.batch_split == 0:
                 self.optimizer_step(lm_loss, risk_loss, hits_loss, s2s_loss, full_loss)
-
         if (i + 1) % self.batch_split != 0:
             self.optimizer_step(lm_loss, risk_loss, hits_loss, s2s_loss, full_loss)
 
-    def _eval_test(self, metric_funcs={}, external_metrics_func=None, epoch=-1, inference=False, is_best=False):
+    def _get_eval_loss(self, contexts, targets, distractors, metrics, index):
+        lengths, enc_contexts = None, []
+        if self.single_input:
+            if isinstance(self.model, TransformerSeq2Seq):
+                input_ids, labels, lengths = targets[0].to(self.device), targets[1].to(self.device), contexts
+                batch_s2s_loss = self.model(input_ids, labels)
+                if isinstance(batch_s2s_loss, tuple):
+                    batch_s2s_loss = batch_s2s_loss[1]
+                batch_hits_acc = torch.tensor(0, dtype=torch.float)
+            else:
+                targets, distractors, lengths = targets.to(self.device), distractors.to(self.device), contexts
+                batch_s2s_loss, batch_hits_acc = self._loss_single(targets, distractors, lengths, None, None)
+        else:
+            contexts, targets, distractors = [c.to(self.device) for c in contexts], targets.to(self.device), \
+                                             distractors.to(self.device)
+            if isinstance(self.model, TransformerSeq2Seq):
+                batch_s2s_loss, enc_contexts = self.model(contexts, targets, return_encoded=True)
+                batch_hits_acc = torch.tensor(0, dtype=torch.float)
+            else:
+
+                # lm loss
+                batch_lm_loss = self._lm_loss(contexts, enc_contexts)
+                metrics['lm_loss'] = (metrics['lm_loss'] * index + batch_lm_loss.item()) / (index + 1)
+
+                # s2s loss on targets
+                batch_s2s_loss, hidden_state, padding_mask = self._s2s_loss(targets, enc_contexts,
+                                                                            self.negative_samples)
+                # hits@1 loss on distractors and targets
+                batch_hits_acc = self._hist(distractors, hidden_state, padding_mask,
+                                            enc_contexts, self.negative_samples)
+                metrics['lm_ppl'] = (metrics['lm_ppl'] * index + math.exp(batch_lm_loss)) / (index + 1)
+
+        metrics['s2s_loss'] = (metrics['s2s_loss'] * index + batch_s2s_loss.item()) / (index + 1)
+        metrics['hits_acc'] = (metrics['hits_acc'] * index + batch_hits_acc.item()) / (index + 1)
+        metrics['s2s_ppl'] = (metrics['s2s_ppl'] * index + math.exp(batch_s2s_loss)) / (index + 1)
+        return metrics, lengths, enc_contexts
+
+    def _get_eval_predictions(self, contexts, targets, lengths, enc_contexts, metrics, metric_funcs,
+                             external_metrics_func, index):
+        string_references, string_predictions = [], []
+        if self.evaluate_full_sequences:
+            if self.single_input:
+                if isinstance(self.model, TransformerSeq2Seq):
+                    labels = targets[1]
+                else:
+                    labels = []
+                    for i in range(targets.shape[0]):
+                        labels.append(targets[i, lengths[i][0] + 1: lengths[i][1], 0])
+                    labels = pad_sequence(labels, batch_first=True, padding_value=self.model.padding_idx)
+            elif not self.full_input:
+                labels = targets if targets.dim() == 2 else targets[:, :, 0]
+            else:
+                labels = []
+                new_targets = []
+                for i in range(targets.shape[0]):
+                    label_start, label_end = -1, targets.shape[1]
+                    for j in range(targets.shape[1]):
+                        if targets[i][j][1] == self.model.sent_dialog_id and label_start == -1:
+                            label_start = j
+                        if targets[i][j][1] == self.model.padding_idx:
+                            label_end = j
+                            break
+                    labels.append(targets[i, label_start: label_end, 0])
+                    new_targets.append(targets[i, : label_start])
+                labels = pad_sequence(labels, batch_first=True, padding_value=self.model.padding_idx)
+                targets = pad_sequence(new_targets, batch_first=True, padding_value=self.model.padding_idx,
+                                       left=True)
+            if self.single_input:
+                predictions = []
+                if isinstance(self.model, TransformerSeq2Seq):
+                    input_ids = targets[0].to(self.device)
+                    predictions = self.model.inference(input_ids)
+                else:
+                    for i in range(targets.size(0)):
+                        input_ids = targets[i, :lengths[i][0] + 1, 0].to(self.device)
+                        token_type_ids = targets[i, :lengths[i][0] + 1, 1].to(self.device)
+                        prediction = self.model.inference(input_ids, token_type_ids)
+                        predictions.append(prediction)
+            else:
+                if isinstance(self.model, TransformerSeq2Seq):
+                    predictions = self.model.inference(contexts, encoder_outputs=enc_contexts)
+                else:
+                    if self.full_input:
+                        predictions = self.model.inference(beam_starts=targets, enc_contexts=enc_contexts)
+                    else:
+                        predictions = self.model.inference(enc_contexts=enc_contexts)
+
+            labels_lens = labels.ne(self.model.padding_idx).sum(dim=-1)
+            if not self.single_input:
+                labels_start = [1] * len(targets)
+                labels = [t[s:l - 1].tolist() for t, s, l in zip(labels, labels_start, labels_lens)]
+            else:
+                labels = [t[: l - 1].tolist() for t, l in zip(labels, labels_lens)]
+
+            for name, func in metric_funcs.items():
+                score = func(predictions, labels)
+                metrics[name] = (metrics[name] * index + score) / (index + 1)
+
+            if external_metrics_func:
+                # Store text strings for external metrics
+                if isinstance(self.vocab, OpenAIGPTTokenizer) or isinstance(self.vocab, GPT2Tokenizer) or \
+                        isinstance(self.vocab, Seq2seqTokenizer):
+                    string_references = list(
+                        self.vocab.decode(t, skip_special_tokens=True, clean_up_tokenization_spaces=False) for t in
+                        labels)
+                    string_predictions = list(
+                        self.vocab.decode(t, skip_special_tokens=True, clean_up_tokenization_spaces=False) for t in
+                        predictions)
+                else:
+                    string_references = list(self.vocab.ids2string(t) for t in labels)
+                    string_predictions = list(self.vocab.ids2string(t) for t in predictions)
+                string_predictions = [x.replace('\n', ' ') for x in string_predictions]
+        return string_predictions, string_references
+
+    def _eval_test(self, metric_funcs={}, external_metrics_func=None, epoch=-1, inference=False, is_best=False,
+                   raw_entail_data=None):
         with torch.no_grad():
             self.model.eval()
             if epoch == -1:
@@ -541,123 +674,16 @@ class Trainer:
                 tqdm_data = tqdm(self.valid_dataloader, desc='Test')
                 self.logger.info('Starting testing on Valid dataset')
             metrics = {name: 0 for name in ('s2s_loss', 'lm_loss', 'hits_acc', 'lm_ppl', 's2s_ppl') + tuple(metric_funcs.keys())}
-            full_references, full_predictions = [], []
+            full_predictions, full_references = [], []
             for i, (contexts, targets, distractors) in enumerate(tqdm_data):
-                negative_samples = self.negative_samples
-                if self.single_input:
-                    if isinstance(self.model, TransformerSeq2Seq):
-                        input_ids, labels, lengths = targets[0].to(self.device), targets[1].to(self.device), contexts
-                        batch_s2s_loss = self.model(input_ids, labels)
-                        batch_hits_acc = torch.tensor(0, dtype=torch.float)
-                    else:
-                        targets, distractors, lengths = targets.to(self.device), distractors.to(self.device), contexts
-                        batch_s2s_loss, batch_hits_acc = self._loss_single(targets, distractors, lengths, None, None)
-                else:
-                    contexts, targets, distractors = [c.to(self.device) for c in contexts], targets.to(self.device), \
-                                                     distractors.to(self.device)
-
-                    enc_contexts = []
-
-                    if isinstance(self.model, TransformerSeq2Seq):
-                        batch_s2s_loss, enc_contexts = self.model(contexts, targets, return_encoded=True)
-                        batch_hits_acc = torch.tensor(0, dtype=torch.float)
-                    else:
-
-                        # lm loss
-                        batch_lm_loss = self._lm_loss(contexts, enc_contexts)
-                        metrics['lm_loss'] = (metrics['lm_loss'] * i + batch_lm_loss.item()) / (i + 1)
-
-                        # s2s loss on targets
-                        batch_s2s_loss, hidden_state, padding_mask = self._s2s_loss(targets, enc_contexts,
-                                                                                    negative_samples)
-                        # hits@1 loss on distractors and targets
-                        batch_hits_acc = self._hist(distractors, hidden_state, padding_mask,
-                                                    enc_contexts, negative_samples)
-                        metrics['lm_ppl'] = (metrics['lm_ppl'] * i + math.exp(batch_lm_loss)) / (i + 1)
-
-                metrics['s2s_loss'] = (metrics['s2s_loss'] * i + batch_s2s_loss.item()) / (i + 1)
-                metrics['hits_acc'] = (metrics['hits_acc'] * i + batch_hits_acc.item()) / (i + 1)
-                metrics['s2s_ppl'] = (metrics['s2s_ppl'] * i + math.exp(batch_s2s_loss)) / (i + 1)
-
+                '''Get the loss, ppl for each batch'''
+                metrics, lengths, enc_contexts = self._get_eval_loss(contexts, targets, distractors, metrics, i)
                 # full sequence loss
-                if self.evaluate_full_sequences:
-                    if self.single_input:
-                        if isinstance(self.model, TransformerSeq2Seq):
-                            labels = targets[1]
-                        else:
-                            labels = []
-                            for i in range(targets.shape[0]):
-                                labels.append(targets[i, lengths[i][0] + 1: lengths[i][1], 0])
-                            labels = pad_sequence(labels, batch_first=True, padding_value=self.model.padding_idx)
-                    elif not self.full_input:
-                        labels = targets if targets.dim() == 2 else targets[:, :, 0]
-                    else:
-                        labels = []
-                        new_targets = []
-                        for i in range(targets.shape[0]):
-                            label_start, label_end = -1, targets.shape[1]
-                            for j in range(targets.shape[1]):
-                                if targets[i][j][1] == self.model.sent_dialog_id and label_start == -1:
-                                    label_start = j
-                                if targets[i][j][1] == self.model.padding_idx:
-                                    label_end = j
-                                    break
-                            labels.append(targets[i, label_start: label_end, 0])
-                            new_targets.append(targets[i, : label_start])
-                        labels = pad_sequence(labels, batch_first=True, padding_value=self.model.padding_idx)
-                        targets = pad_sequence(new_targets, batch_first=True, padding_value=self.model.padding_idx,
-                                                   left=True)
-                    if self.single_input:
-                        predictions = []
-                        if isinstance(self.model, TransformerSeq2Seq):
-                            input_ids = targets[0].to(self.device)
-                            predictions = self.model.inference(input_ids)
-                        else:
-                            for i in range(targets.size(0)):
-                                input_ids = targets[i, :lengths[i][0] + 1, 0]
-                                token_type_ids = targets[i, :lengths[i][0] + 1, 1]
-                                prediction = self.model.inference(input_ids, token_type_ids)
-                                predictions.append(prediction)
-                    else:
-                        if isinstance(self.model, TransformerSeq2Seq):
-                                predictions = self.model.inference(contexts, encoder_outputs=enc_contexts)
-                        else:
-                            if self.full_input:
-                                predictions = self.model.inference(beam_starts=targets, enc_contexts=enc_contexts)
-                            else:
-                                predictions = self.model.inference(enc_contexts=enc_contexts)
-
-                    labels_lens = labels.ne(self.model.padding_idx).sum(dim=-1)
-                    if not self.single_input:
-                        labels_start = [1] * len(targets)
-                        labels = [t[s:l - 1].tolist() for t, s, l in zip(labels, labels_start, labels_lens)]
-                    else:
-                        labels = [t[: l - 1].tolist() for t, l in zip(labels, labels_lens)]
-
-                    for name, func in metric_funcs.items():
-                        score = func(predictions, labels)
-                        metrics[name] = (metrics[name] * i + score) / (i + 1)
-
-                    if external_metrics_func:
-                        # Store text strings for external metrics
-                        if isinstance(self.vocab, OpenAIGPTTokenizer) or isinstance(self.vocab, GPT2Tokenizer) or \
-                            isinstance(self.vocab, Seq2seqTokenizer):
-                            string_targets = list(
-                                self.vocab.decode(t, skip_special_tokens=True, clean_up_tokenization_spaces=False) for t in labels)
-                            string_predictions = list(
-                                self.vocab.decode(t, skip_special_tokens=True, clean_up_tokenization_spaces=False) for t in predictions)
-                        else:
-                            string_targets = list(self.vocab.ids2string(t) for t in labels)
-                            string_predictions = list(self.vocab.ids2string(t) for t in predictions)
-                        string_predictions = [x.replace('\n', ' ') for x in string_predictions]
-                        full_references.extend(string_targets)
-                        full_predictions.extend(string_predictions)
-                        # print(len(string_predictions))
-                        # print(len(string_targets))
-
+                cur_predictions, cur_references = self._get_eval_predictions(contexts, targets, lengths, enc_contexts,
+                             metrics, metric_funcs, external_metrics_func, i)
+                full_predictions.extend(cur_predictions)
+                full_references.extend(cur_references)
                 tqdm_data.set_postfix(dict(**metrics))
-            # with open('predictions.pickle', 'wb') as f:
-            #     pickle.dump(full_predictions, f)
 
             if external_metrics_func and self.evaluate_full_sequences:
                 external_metrics = external_metrics_func(full_references, full_predictions, epoch, is_best)
@@ -669,15 +695,19 @@ class Trainer:
                 for key, value in metrics.items():
                     self.writer.add_scalar("eval/{}".format(key), value, global_step=global_step)
             self.logger.info(metrics)
+
             if epoch != -1:
                 if metrics['s2s_ppl'] < self.best_ppl:
                     self.logger.info('Current ppl BEATS the previous best one, previous best is %.5f', self.best_ppl)
                     self.best_ppl = metrics['s2s_ppl']
                     torch.save(self.model.state_dict(), self.best_model_path)
-                    self.logger.info('Best model is saved on epoch %d', epoch)
                 else:
+                    self.patience_cnt += 1
                     self.logger.info('Current ppl CANNOT BEATS the previous best one, previous best is %.5f', self.best_ppl)
-            if epoch % 5 == 0 and epoch >= 5:
+                    if self.patience > 0 and self.patience_cnt > self.patience:
+                        self.stop_training = True
+            if epoch % self.model_saving_interval == 0 and epoch >= self.model_saving_interval and \
+                    self.model_type in ['seq2seq']:
                 torch.save(self.model.state_dict(), self.best_model_path + '_' + str(epoch))
 
     def _build_split_data_list(self, targets, distractors, lengths, distractor_lengths, split_batch_size):
@@ -768,7 +798,7 @@ class Trainer:
                 self._eval_test(metric_funcs, external_metrics_func, epoch, inference, is_best=True)
 
     def train(self, after_epoch_funcs=[], risk_func=None):
-        for epoch in range(self.n_epochs):
+        for epoch in range(1, self.n_epochs + 1):
             self.logger.info('===============================')
             self.logger.info('Start training on Epoch %d', epoch)
             self._eval_train(epoch, risk_func)
@@ -778,6 +808,9 @@ class Trainer:
                 func(epoch)
             self.logger.info('End training on Epoch %d', epoch)
             self.logger.info('===============================')
+            if self.stop_training:
+                self.logger.info('Training will be STOPPED in advance due to exceeding patience number')
+                break
 
         for func in after_epoch_funcs:
             func(-1)
