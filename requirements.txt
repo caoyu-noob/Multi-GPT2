@@ -7,3 +7,4 @@ ftfy
 tensorboardX==2.0
 future
 pillow
+git-python
