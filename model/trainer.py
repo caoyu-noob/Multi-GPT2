@@ -16,6 +16,7 @@
 
 import logging
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -81,7 +82,7 @@ class Trainer:
         self.max_length = max_length
         self.max_y_length = max_y_length
         self.new_dataset = new_dataset
-        self.best_ppl = 1e5
+        self.best_ppl = 1e35
         self.best_model_path = best_model_path
         if train_dataset is not None:
             self.negative_samples = train_dataset.negative_samples
@@ -727,47 +728,6 @@ class Trainer:
     def _concat(self, xs):
         return torch.cat([x.view(-1) for x in xs])
 
-    def get_hessian_vector_product(self, weight_grads, train_targets, train_distractors, train_lengths, r=5):
-        R = r / (self._concat(weight_grads).norm() + 1)
-        for p, v in zip(self.model.parameters(), weight_grads):
-            p.data.add_(R, v)
-        grads_p, grads_n = None, None
-        for (targets, distractors, lengths) in zip(train_targets, train_distractors, train_lengths):
-            targets, distractors = targets.to(self.device), distractors.to(self.device)
-            batch_s2s_loss, batch_hits_loss = self._loss_single(targets, distractors, lengths, None, None)
-            loss = self.s2s_weight * batch_s2s_loss / self.batch_split + \
-                   self.hits_weight * batch_hits_loss / self.batch_split
-            if grads_p is None:
-                grads_p = list(torch.autograd.grad(loss, self.model.get_alpha_parameters(), allow_unused=True))
-                self._clip_grad_norm(grads_p, self.alpha_clip_grad)
-            else:
-                tmp_g = list(torch.autograd.grad(loss, self.model.get_alpha_parameters(), allow_unused=True))
-                self._clip_grad_norm(tmp_g, self.alpha_clip_grad)
-                for i, g in enumerate(tmp_g):
-                    grads_p[i] += g
-        grads_p = tuple(grads_p)
-
-        for p, v in zip(self.model.parameters(), weight_grads):
-            p.data.sub_(2 * R, v)
-        for (targets, distractors, lengths) in zip(train_targets, train_distractors, train_lengths):
-            targets, distractors = targets.to(self.device), distractors.to(self.device)
-            batch_s2s_loss, batch_hits_loss = self._loss_single(targets, distractors, lengths, None, None)
-            loss = self.s2s_weight * batch_s2s_loss / self.batch_split + \
-                   self.hits_weight * batch_hits_loss / self.batch_split
-            if grads_n is None:
-                grads_n = list(torch.autograd.grad(loss, self.model.get_alpha_parameters(), allow_unused=True))
-                self._clip_grad_norm(grads_n, self.alpha_clip_grad)
-            else:
-                tmp_g = list(torch.autograd.grad(loss, self.model.get_alpha_parameters(), allow_unused=True))
-                self._clip_grad_norm(tmp_g, self.alpha_clip_grad)
-                for i, g in enumerate(tmp_g):
-                    grads_n[i] += g
-        grads_n = tuple(grads_n)
-        for p, v in zip(self.model.parameters(), weight_grads):
-            p.data.add_(R, v)
-
-        return [(x - y).div_(2 * R) for x, y in zip(grads_p, grads_n)], grads_p, grads_n, R
-
     def _clip_grad_norm(self, grads, max_norm, norm_type=2):
         max_norm = float(max_norm)
         norm_type = float(norm_type)
@@ -790,12 +750,16 @@ class Trainer:
             self._eval_test(metric_funcs, external_metrics_func, epoch, inference)
             if epoch == -1 and not inference:
                 self.logger.info('Loading the best model...')
-                state_dict = torch.load(self.best_model_path, map_location=self.device)
-                if state_dict.__contains__('model'):
-                    self.model.load_state_dict(state_dict['model'], strict=False)
+                if os.path.exists(self.best_model_path):
+                    state_dict = torch.load(self.best_model_path, map_location=self.device)
+                    if state_dict.__contains__('model'):
+                        self.model.load_state_dict(state_dict['model'], strict=False)
+                    else:
+                        self.model.load_state_dict(state_dict)
+                    self._eval_test(metric_funcs, external_metrics_func, epoch, inference, is_best=True)
                 else:
-                    self.model.load_state_dict(state_dict)
-                self._eval_test(metric_funcs, external_metrics_func, epoch, inference, is_best=True)
+                    self.logger.warning('The PPL of current model is higher than the initial threshold, '
+                                        'no test stage will be executed.')
 
     def train(self, after_epoch_funcs=[], risk_func=None):
         for epoch in range(1, self.n_epochs + 1):

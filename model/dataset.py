@@ -195,6 +195,22 @@ class FacebookDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+    def _parse_data(self, paths, vocab, data_type, parsed_data):
+        data = None
+        if data_type == 'persona':
+            if not parsed_data:
+                parsed_data = sum([FacebookDataset.parse_data(path) for path in paths], [])
+            data = FacebookDataset.make_dataset(parsed_data, vocab)
+        elif data_type == 'emoji':
+            if not parsed_data:
+                parsed_data = sum([FacebookDataset.parse_data_emoji(path) for path in paths], [])
+            data = FacebookDataset.make_dataset(parsed_data, vocab)
+        elif data_type == 'daily':
+            if not parsed_data:
+                parsed_data = sum([FacebookDataset.parse_data_daily(path) for path in paths], [])
+            data = FacebookDataset.make_dataset(parsed_data, vocab)
+        return data
+
     def _augment(self, sentences, info=False):
 
         if not self.augment:
